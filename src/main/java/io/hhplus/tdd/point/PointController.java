@@ -7,6 +7,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 
 @RestController
 @RequestMapping("/point")
@@ -15,10 +17,21 @@ public class PointController {
     private static final Logger log = LoggerFactory.getLogger(PointController.class);
     private final UserPointTable userPointTable;
     private final PointHistoryTable pointHistoryTable;
+    
+    // 사용자별 락 관리를 위한 ConcurrentHashMap
+    private final ConcurrentHashMap<Long, ReentrantLock> userLocks = new ConcurrentHashMap<>();
 
     public PointController(UserPointTable userPointTable, PointHistoryTable pointHistoryTable) {
         this.userPointTable = userPointTable;
         this.pointHistoryTable = pointHistoryTable;
+    }
+
+    /**
+     * 사용자별 락을 가져오는 메서드
+     * 동일 사용자에 대해서는 같은 락 인스턴스를 반환하여 동시성 제어
+     */
+    private ReentrantLock getUserLock(long userId) {
+        return userLocks.computeIfAbsent(userId, k -> new ReentrantLock());
     }
 
     /**
@@ -62,19 +75,28 @@ public class PointController {
             throw new IllegalArgumentException("충전 금액은 0보다 커야 합니다.");
         }
 
-        UserPoint currentPoint = userPointTable.selectById(id);
-        log.info("현재 포인트 조회 - ID: {}, 현재포인트: {}", id, currentPoint.point());
-        
-        long newAmount = currentPoint.point() + amount;
-        log.info("포인트 충전 계산 - 현재: {} + 충전: {} = 새포인트: {}", currentPoint.point(), amount, newAmount);
-        
-        UserPoint updatedPoint = userPointTable.insertOrUpdate(id, newAmount);
-        pointHistoryTable.insert(id, amount, TransactionType.CHARGE, updatedPoint.updateMillis());
-        
-        log.info("포인트 충전 완료 - 사용자 ID: {}, 최종포인트: {}, 업데이트시간: {}", 
-                updatedPoint.id(), updatedPoint.point(), updatedPoint.updateMillis());
-        
-        return updatedPoint;
+        ReentrantLock lock = getUserLock(id);
+        lock.lock();
+        try {
+            log.info("포인트 충전 락 획득 - 사용자 ID: {}, 대기 스레드 수: {}", id, lock.getQueueLength());
+            
+            UserPoint currentPoint = userPointTable.selectById(id);
+            log.info("현재 포인트 조회 - ID: {}, 현재포인트: {}", id, currentPoint.point());
+            
+            long newAmount = currentPoint.point() + amount;
+            log.info("포인트 충전 계산 - 현재: {} + 충전: {} = 새포인트: {}", currentPoint.point(), amount, newAmount);
+            
+            UserPoint updatedPoint = userPointTable.insertOrUpdate(id, newAmount);
+            pointHistoryTable.insert(id, amount, TransactionType.CHARGE, updatedPoint.updateMillis());
+            
+            log.info("포인트 충전 완료 - 사용자 ID: {}, 최종포인트: {}, 업데이트시간: {}", 
+                    updatedPoint.id(), updatedPoint.point(), updatedPoint.updateMillis());
+            
+            return updatedPoint;
+        } finally {
+            lock.unlock();
+            log.info("포인트 충전 락 해제 - 사용자 ID: {}", id);
+        }
     }
 
     /**
@@ -92,23 +114,32 @@ public class PointController {
             throw new IllegalArgumentException("사용 금액은 0보다 커야 합니다.");
         }
 
-        UserPoint currentPoint = userPointTable.selectById(id);
-        log.info("현재 포인트 조회 - ID: {}, 현재포인트: {}", id, currentPoint.point());
-        
-        if (currentPoint.point() < amount) {
-            log.error("포인트 사용 실패 - 잔고부족. 현재잔고: {}, 사용요청: {}", currentPoint.point(), amount);
-            throw new IllegalArgumentException("잔고가 부족합니다. 현재 잔고: " + currentPoint.point());
+        ReentrantLock lock = getUserLock(id);
+        lock.lock();
+        try {
+            log.info("포인트 사용 락 획득 - 사용자 ID: {}, 대기 스레드 수: {}", id, lock.getQueueLength());
+            
+            UserPoint currentPoint = userPointTable.selectById(id);
+            log.info("현재 포인트 조회 - ID: {}, 현재포인트: {}", id, currentPoint.point());
+            
+            if (currentPoint.point() < amount) {
+                log.error("포인트 사용 실패 - 잔고부족. 현재잔고: {}, 사용요청: {}", currentPoint.point(), amount);
+                throw new IllegalArgumentException("잔고가 부족합니다. 현재 잔고: " + currentPoint.point());
+            }
+            
+            long newAmount = currentPoint.point() - amount;
+            log.info("포인트 사용 계산 - 현재: {} - 사용: {} = 새포인트: {}", currentPoint.point(), amount, newAmount);
+            
+            UserPoint updatedPoint = userPointTable.insertOrUpdate(id, newAmount);
+            pointHistoryTable.insert(id, amount, TransactionType.USE, updatedPoint.updateMillis());
+            
+            log.info("포인트 사용 완료 - 사용자 ID: {}, 최종포인트: {}, 업데이트시간: {}", 
+                    updatedPoint.id(), updatedPoint.point(), updatedPoint.updateMillis());
+            
+            return updatedPoint;
+        } finally {
+            lock.unlock();
+            log.info("포인트 사용 락 해제 - 사용자 ID: {}", id);
         }
-        
-        long newAmount = currentPoint.point() - amount;
-        log.info("포인트 사용 계산 - 현재: {} - 사용: {} = 새포인트: {}", currentPoint.point(), amount, newAmount);
-        
-        UserPoint updatedPoint = userPointTable.insertOrUpdate(id, newAmount);
-        pointHistoryTable.insert(id, amount, TransactionType.USE, updatedPoint.updateMillis());
-        
-        log.info("포인트 사용 완료 - 사용자 ID: {}, 최종포인트: {}, 업데이트시간: {}", 
-                updatedPoint.id(), updatedPoint.point(), updatedPoint.updateMillis());
-        
-        return updatedPoint;
     }
 }
